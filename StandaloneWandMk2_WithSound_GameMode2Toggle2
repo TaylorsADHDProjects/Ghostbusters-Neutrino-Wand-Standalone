@@ -1,0 +1,698 @@
+#include <Adafruit_NeoPixel.h>
+#include <SoftwareSerial.h>
+#include <DFRobotDFPlayerMini.h>
+
+// LED pin
+const int ledPin = 13;
+
+// Button pins
+const int button1Pin = 2;
+const int button2Pin = 3;
+const int button3Pin = 4;
+
+// Toggle switch pin
+const int toggleSwitchPin = 5;
+
+// DFPlayer Mini pins
+const int dfPlayerRX = 10;
+const int dfPlayerTX = 11;
+
+// NeoPixel configuration
+const int neoPixelPin1 = 6;
+const int neoPixelPin2 = 7;
+const int neoPixelPin3 = 8;
+
+const int numPixels1 = 5;
+const int numPixels2 = 13;
+const int numPixels3 = 13;
+
+// Create objects
+Adafruit_NeoPixel strip1(numPixels1, neoPixelPin1, NEO_GRB + NEO_KHZ800);
+Adafruit_NeoPixel strip2(numPixels2, neoPixelPin2, NEO_GRB + NEO_KHZ800);
+Adafruit_NeoPixel strip3(numPixels3, neoPixelPin3, NEO_GRB + NEO_KHZ800);
+SoftwareSerial dfPlayerSerial(dfPlayerRX, dfPlayerTX);
+DFRobotDFPlayerMini dfPlayer;
+
+// Variables for counting on strip 1
+int currentPixel = 0;
+bool countingUp = true;
+unsigned long lastCountUpdate = 0;
+const int countSpeed = 300;
+
+// Variables for LED blinking
+bool ledState = false;
+unsigned long lastLedUpdate = 0;
+const int ledBlinkSpeed = 150;
+
+// Variables for streaming effect
+int streamPosition = 0;
+unsigned long lastStreamUpdate = 0;
+const int continuousStreamSpeed = 33;  // Back to original speed - testing stability
+const int burstStreamSpeed = 13;  // Burst modes speed
+
+// Firing mode variables (8 modes total)
+int firingMode = 0;  // 0-7: Normal1, Normal2, Green1, Green2, Blue1, Blue2, Yellow1, Yellow2
+bool button3LastState = HIGH;
+int lastFiringMode = 0;  // Track last mode to detect changes
+
+// Mode change sound effect variables
+bool playingModeChangeSound = false;
+unsigned long modeChangeSoundStartTime = 0;
+bool firstModeTrackPlayed = false;
+int pendingSecondTrack = 0;
+const unsigned long modeChangeTrackDuration = 2000;  // Duration for mode change tracks
+
+// Idle track assignments for each firing mode
+const int modeIdleTrack[8] = {3, 3, 12, 12, 19, 19, 28, 28};  // Normal modes = track 3, Green modes = track 12, Blue modes = track 19, Yellow modes = track 28
+
+// Track assignments for each firing mode [hold_track, release_track]
+const int modeTrackHold[8] = {6, 8, 13, 16, 20, 24, 30, 34};      // Mode 1 (Normal2) = track 8, Mode 2 (Green1) = track 13, Mode 3 (Green2) = track 16, Mode 4 (Blue1) = track 20, Mode 5 (Blue2) = track 24, Mode 6 (Yellow1) = track 30, Mode 7 (Yellow2) = track 34
+const int modeTrackRelease[8] = {4, 0, 14, 0, 21, 0, 31, 0};   // Mode 1 (Normal2) = 0 (no tail), Mode 2 (Green1) = track 14, Mode 3 (Green2) = 0 (no tail), Mode 4 (Blue1) = track 21, Mode 5 (Blue2) = 0 (no tail), Mode 6 (Yellow1) = track 31, Mode 7 (Yellow2) = 0 (no tail)
+
+// Overheat mode variables
+bool overheatMode = false;
+unsigned long overheatStartTime = 0;
+unsigned long buttonHoldStartTime = 0;
+bool buttonWasPressed = false;
+const unsigned long trackSwitchThreshold = 8000;  // Switch to next track at 8 seconds
+const unsigned long holdThreshold = 10000;  // Overheat triggers at 10 seconds
+const unsigned long overheatDuration = 11000;
+bool track5Playing = false;
+bool track38Playing = false;
+bool track40Playing = false;
+unsigned long overheatMusicStartTime = 0;
+const unsigned long track5Duration = 3000;
+const unsigned long track38Duration = 3000;
+
+// Music states
+bool dfPlayerInitialized = false;
+bool track1Started = false;
+bool track3Started = false;
+bool track6Playing = false;
+bool track4Playing = false;
+unsigned long track1StartTime = 0;
+unsigned long track4StartTime = 0;
+const unsigned long track1Duration = 5000;
+const unsigned long track4Duration = 2000;
+bool lastFlowButtonState = false;
+
+// Burst fire mode variables
+bool burstFireActive = false;
+unsigned long burstFireStartTime = 0;
+unsigned long burstFireDuration = 1000;  // Variable burst sound duration (1-3 seconds depending on mode)
+const unsigned long burstLightDuration = 100;  // All burst lights stay on for 0.1 seconds
+
+// Toggle switch state tracking
+bool lastToggleState = HIGH;
+bool shutdownTrackPlayed = false;
+
+// Colors
+uint32_t blue = strip2.Color(0, 0, 255);
+uint32_t orange = strip2.Color(255, 100, 0);
+uint32_t green = strip2.Color(0, 255, 0);
+uint32_t yellow = strip2.Color(255, 255, 0);
+
+// Send raw DFPlayer command for button actions only
+void playTrackRaw(int trackNum) {
+  // Skip placeholder tracks and track 0 (no tail)
+  if (trackNum == 999 || trackNum == 0) return;
+  
+  byte buffer[10] = {0x7E, 0xFF, 0x06, 0x03, 0x00, 0x00, (byte)trackNum, 0x00, 0x00, 0xEF};
+  int checksum = -(buffer[1] + buffer[2] + buffer[3] + buffer[4] + buffer[5] + buffer[6]);
+  buffer[7] = (checksum >> 8) & 0xFF;
+  buffer[8] = checksum & 0xFF;
+  
+  for (int i = 0; i < 10; i++) {
+    dfPlayerSerial.write(buffer[i]);
+  }
+}
+
+// Send loop command for repeating track
+void loopTrackRaw(int trackNum) {
+  if (trackNum == 999 || trackNum == 0) return;
+  
+  byte buffer[10] = {0x7E, 0xFF, 0x06, 0x08, 0x00, 0x00, (byte)trackNum, 0x00, 0x00, 0xEF};
+  int checksum = -(buffer[1] + buffer[2] + buffer[3] + buffer[4] + buffer[5] + buffer[6]);
+  buffer[7] = (checksum >> 8) & 0xFF;
+  buffer[8] = checksum & 0xFF;
+  
+  for (int i = 0; i < 10; i++) {
+    dfPlayerSerial.write(buffer[i]);
+  }
+}
+
+void setup() {
+  Serial.begin(115200);  // Different baud rate from DFPlayer to avoid interference
+  Serial.println("Setup starting...");
+  
+  pinMode(ledPin, OUTPUT);
+  pinMode(button1Pin, INPUT_PULLUP);
+  pinMode(button2Pin, INPUT_PULLUP);
+  pinMode(button3Pin, INPUT_PULLUP);
+  pinMode(toggleSwitchPin, INPUT_PULLUP);
+  
+  // Read the actual toggle switch state at startup
+  lastToggleState = digitalRead(toggleSwitchPin);
+  
+  strip1.begin();
+  strip1.setBrightness(50);
+  strip1.show();
+  
+  strip2.begin();
+  strip2.setBrightness(50);
+  strip2.show();
+  
+  strip3.begin();
+  strip3.setBrightness(50);
+  strip3.show();
+  
+  dfPlayerSerial.begin(9600);
+  
+  // Wait for DFPlayer to be ready, then set volume using raw command
+  delay(3000);
+  
+  // Set volume to 20 using raw command (0x7E FF 06 06 00 00 14)
+  byte volBuffer[10] = {0x7E, 0xFF, 0x06, 0x06, 0x00, 0x00, 0x14, 0x00, 0x00, 0xEF};
+  int volChecksum = -(volBuffer[1] + volBuffer[2] + volBuffer[3] + volBuffer[4] + volBuffer[5] + volBuffer[6]);
+  volBuffer[7] = (volChecksum >> 8) & 0xFF;
+  volBuffer[8] = volChecksum & 0xFF;
+  for (int i = 0; i < 10; i++) {
+    dfPlayerSerial.write(volBuffer[i]);
+  }
+  
+  dfPlayerInitialized = true;
+  Serial.println("DFPlayer ready!");
+  
+  lastCountUpdate = millis();
+  lastStreamUpdate = millis();
+  lastLedUpdate = millis();
+  
+  Serial.println("Setup complete!");
+}
+
+void loop() {
+  // Read toggle switch state
+  bool toggleSwitchOn = digitalRead(toggleSwitchPin) == LOW;  // Active LOW with pullup
+  bool lastToggleSwitchOn = lastToggleState == LOW;  // Convert lastToggleState to boolean for comparison
+  
+  // Check for toggle switch state change
+  if (toggleSwitchOn != lastToggleSwitchOn) {
+    
+    if (!toggleSwitchOn && dfPlayerInitialized) {
+      // Switch turned OFF - play shutdown track only if DFPlayer is ready
+      playTrackRaw(2);
+      delay(100);  // Small delay to ensure command is sent
+      shutdownTrackPlayed = true;
+      
+      // Turn off all LEDs
+      strip1.clear();
+      strip2.clear();
+      strip3.clear();
+      strip1.show();
+      strip2.show();
+      strip3.show();
+      digitalWrite(ledPin, LOW);
+    } else if (toggleSwitchOn) {
+      // Switch turned ON - reset to initial state and play startup track
+      shutdownTrackPlayed = false;
+      track1Started = false;
+      track3Started = false;
+      // Don't reset dfPlayerInitialized - keep it initialized!
+      overheatMode = false;
+      burstFireActive = false;
+      track6Playing = false;
+      track4Playing = false;
+      playingModeChangeSound = false;
+      currentPixel = 0;
+      countingUp = true;
+      
+      // Play startup track when switch turns on
+      if (dfPlayerInitialized) {
+        delay(100);  // Small delay to ensure ready
+        randomSeed(analogRead(A0));
+        int startupTracks[] = {1, 41, 51};
+        int randomStartup = startupTracks[random(0, 3)];
+        playTrackRaw(randomStartup);
+        track1Started = true;
+        track1StartTime = millis();
+      }
+    }
+    lastToggleState = digitalRead(toggleSwitchPin);  // Update at end of each loop
+  }
+  
+  // TOGGLE SWITCH ON - Normal operation
+  if (toggleSwitchOn) {
+    // Read button states early so they're available throughout the loop
+    bool button1Pressed = digitalRead(button1Pin) == LOW;
+    bool button2Pressed = digitalRead(button2Pin) == LOW;
+    bool flowButtonPressed = button1Pressed || button2Pressed;
+    
+    // If switch is ON at boot, play startup track once
+    if (!track1Started && dfPlayerInitialized) {
+      delay(100);  // Small delay to ensure ready
+      randomSeed(analogRead(A0));
+      int startupTracks[] = {1, 41, 51};
+      int randomStartup = startupTracks[random(0, 3)];
+      playTrackRaw(randomStartup);
+      track1Started = true;
+      track1StartTime = millis();
+    }
+    
+    // Transition to idle track after track 1 duration
+    if (track1Started && !track3Started && (millis() - track1StartTime >= track1Duration)) {
+      // Play the current mode's idle track instead of default track 3
+      if (modeIdleTrack[firingMode] != 999) {
+        playTrackRaw(modeIdleTrack[firingMode]);
+      }
+      track3Started = true;
+    }
+    
+    // Return to track 3 after track 4 finishes
+    if (track4Playing && (millis() - track4StartTime >= track4Duration)) {
+      // Return to the current mode's idle track
+      if (modeIdleTrack[firingMode] != 999 && !playingModeChangeSound) {
+        playTrackRaw(modeIdleTrack[firingMode]);
+      }
+      track4Playing = false;
+    }
+    
+    // Handle mode change sound sequence
+    if (playingModeChangeSound) {
+      unsigned long elapsed = millis() - modeChangeSoundStartTime;
+      
+      // If we have a second track to play and first track duration has passed
+      if (pendingSecondTrack != 0 && !firstModeTrackPlayed && elapsed >= modeChangeTrackDuration) {
+        playTrackRaw(pendingSecondTrack);
+        firstModeTrackPlayed = true;
+      }
+      
+      // End mode change sound sequence and play idle track
+      unsigned long totalDuration = (pendingSecondTrack != 0) ? (modeChangeTrackDuration * 2) : modeChangeTrackDuration;
+      if (elapsed >= totalDuration) {
+        playingModeChangeSound = false;
+        firstModeTrackPlayed = false;
+        pendingSecondTrack = 0;
+        
+        // Always play the new mode's idle track when mode change completes
+        if (modeIdleTrack[firingMode] != 999 && !overheatMode) {
+          playTrackRaw(modeIdleTrack[firingMode]);
+        }
+      }
+    }
+    
+    // Handle button music - use current firing mode's tracks
+    if (flowButtonPressed && !lastFlowButtonState && !overheatMode && !playingModeChangeSound) {
+      // For burst modes (1, 3, 5, 7), start burst fire sequence
+      if (firingMode == 1 || firingMode == 3 || firingMode == 5 || firingMode == 7) {
+        playTrackRaw(modeTrackHold[firingMode]);
+        burstFireActive = true;
+        burstFireStartTime = millis();
+        // Normal 2 (mode 1) has 3 second sound
+        // Blue 2 (mode 5), Yellow 2 (mode 7) have 2 second sound
+        // Green 2 (mode 3) has 1 second sound
+        if (firingMode == 1) {
+          burstFireDuration = 3000;
+        } else if (firingMode == 5 || firingMode == 7) {
+          burstFireDuration = 2000;
+        } else {
+          burstFireDuration = 1000;
+        }
+        track6Playing = true;
+        track4Playing = false;
+      }
+      // For continuous modes (0, 2, 4, 6)
+      else {
+        playTrackRaw(modeTrackHold[firingMode]);
+        track6Playing = true;
+        track4Playing = false;
+      }
+    } else if (!flowButtonPressed && lastFlowButtonState && !overheatMode && track6Playing && !playingModeChangeSound) {
+      // Only handle button release for continuous modes (not burst modes)
+      if (firingMode != 1 && firingMode != 3 && firingMode != 5 && firingMode != 7) {
+        // Only play release track if it's not 0 (no tail for some modes)
+        if (modeTrackRelease[firingMode] != 0) {
+          playTrackRaw(modeTrackRelease[firingMode]);
+          track4Playing = true;
+          track4StartTime = millis();
+        } else {
+          // For modes with no tail, go directly back to idle track
+          if (modeIdleTrack[firingMode] != 999) {
+            playTrackRaw(modeIdleTrack[firingMode]);
+          }
+        }
+        track6Playing = false;
+      }
+    }
+    
+    // Handle burst fire completion
+    if (burstFireActive && (millis() - burstFireStartTime >= burstFireDuration)) {
+      burstFireActive = false;
+      track6Playing = false;
+      
+      // Return directly to idle track (burst modes have no tail - modeTrackRelease = 0)
+      if (modeIdleTrack[firingMode] != 999 && !playingModeChangeSound) {
+        playTrackRaw(modeIdleTrack[firingMode]);
+      }
+    }
+    
+    lastFlowButtonState = flowButtonPressed;
+    
+    // Track button hold time for overheat trigger
+    if (!overheatMode) {
+      if (flowButtonPressed) {
+        if (!buttonWasPressed) {
+          buttonHoldStartTime = millis();
+          buttonWasPressed = true;
+        } else {
+          unsigned long holdTime = millis() - buttonHoldStartTime;
+          
+          // For Normal mode 1, Blue mode 1, and Yellow mode 1, switch to next track after 8 seconds
+          if ((firingMode == 0 || firingMode == 4 || firingMode == 6) && holdTime >= trackSwitchThreshold && track6Playing) {
+            // Normal mode 1: switch from track 6 to track 7
+            // Blue mode 1: switch from track 20 to track 22
+            // Yellow mode 1: switch from track 30 to track 32
+            int nextTrack;
+            if (firingMode == 0) nextTrack = 7;
+            else if (firingMode == 4) nextTrack = 22;
+            else nextTrack = 32;
+            playTrackRaw(nextTrack);
+            track6Playing = false;  // Mark that we've switched tracks
+          }
+          
+          if (holdTime >= holdThreshold) {
+            overheatMode = true;
+            overheatStartTime = millis();
+            // Blue mode 1 uses track 23, Yellow mode 1 uses track 33, others use track 5
+            int overheatStartTrack = 5;
+            if (firingMode == 4) overheatStartTrack = 23;
+            else if (firingMode == 6) overheatStartTrack = 33;
+            playTrackRaw(overheatStartTrack);
+            track5Playing = true;
+            track38Playing = false;
+            track40Playing = false;
+            overheatMusicStartTime = millis();
+          }
+        }
+      } else {
+        buttonWasPressed = false;
+      }
+    }
+    
+    // Overheat music sequence
+    if (overheatMode) {
+      unsigned long elapsedMusic = millis() - overheatMusicStartTime;
+      
+      if (track5Playing && elapsedMusic >= track5Duration) {
+        playTrackRaw(38);
+        track5Playing = false;
+        track38Playing = true;
+      }
+      
+      if (track38Playing && elapsedMusic >= (track5Duration + track38Duration)) {
+        playTrackRaw(40);
+        track38Playing = false;
+        track40Playing = true;
+      }
+    }
+    
+    // End overheat mode and return to current mode's idle track
+    if (overheatMode && (millis() - overheatStartTime >= overheatDuration)) {
+      overheatMode = false;
+      track5Playing = false;
+      track38Playing = false;
+      track40Playing = false;
+      currentPixel = 0;
+      countingUp = true;
+      // Return to the current firing mode's idle track
+      if (modeIdleTrack[firingMode] != 999) {
+        playTrackRaw(modeIdleTrack[firingMode]);
+      }
+    }
+    
+    // LED blink speed - 3x faster in overheat mode
+    int currentLedBlinkSpeed = overheatMode ? (ledBlinkSpeed / 3) : ledBlinkSpeed;
+    
+    if (millis() - lastLedUpdate >= currentLedBlinkSpeed) {
+      lastLedUpdate = millis();
+      ledState = !ledState;
+      digitalWrite(ledPin, ledState ? HIGH : LOW);
+    }
+    
+    // Button 3 cycles through 8 firing modes
+    bool button3CurrentState = digitalRead(button3Pin);
+    if (button3LastState == HIGH && button3CurrentState == LOW && dfPlayerInitialized) {
+      int previousMode = firingMode;
+      firingMode++;
+      if (firingMode > 7) {
+        firingMode = 0;
+      }
+      
+      // Detect specific mode transitions and play appropriate sounds
+      // Normal 2 (mode 1) -> Green 1 (mode 2): play track 10
+      if (previousMode == 1 && firingMode == 2) {
+        playTrackRaw(10);
+        playingModeChangeSound = true;
+        modeChangeSoundStartTime = millis();
+        pendingSecondTrack = 0;
+        firstModeTrackPlayed = false;
+      }
+      // Green 2 (mode 3) -> Blue 1 (mode 4): play track 11, then track 17
+      else if (previousMode == 3 && firingMode == 4) {
+        playTrackRaw(11);
+        playingModeChangeSound = true;
+        modeChangeSoundStartTime = millis();
+        pendingSecondTrack = 17;
+        firstModeTrackPlayed = false;
+      }
+      // Blue 2 (mode 5) -> Yellow 1 (mode 6): play track 18, then track 26
+      else if (previousMode == 5 && firingMode == 6) {
+        playTrackRaw(18);
+        playingModeChangeSound = true;
+        modeChangeSoundStartTime = millis();
+        pendingSecondTrack = 26;
+        firstModeTrackPlayed = false;
+      }
+      // Yellow 2 (mode 7) -> Normal 1 (mode 0): play track 27
+      else if (previousMode == 7 && firingMode == 0) {
+        playTrackRaw(27);
+        playingModeChangeSound = true;
+        modeChangeSoundStartTime = millis();
+        pendingSecondTrack = 0;
+        firstModeTrackPlayed = false;
+      }
+      // For all other transitions, play the new mode's idle track immediately
+      else if (modeIdleTrack[firingMode] != 999 && !overheatMode) {
+        playTrackRaw(modeIdleTrack[firingMode]);
+      }
+      
+      lastFiringMode = firingMode;
+    }
+    button3LastState = button3CurrentState;
+    
+    // Handle strip 1 - countdown when button held
+    if (flowButtonPressed && buttonWasPressed && !overheatMode) {
+      unsigned long holdTime = millis() - buttonHoldStartTime;
+      // Map from 0 to holdThreshold (10 seconds) to segments 1-5 (start with 1 segment already lit)
+      int segmentsLit = map(holdTime, 0, holdThreshold, 1, numPixels1);
+      if (segmentsLit > numPixels1) segmentsLit = numPixels1;
+      
+      strip1.clear();
+      uint32_t strip1Color;
+      
+      // Color based on firing mode
+      if (firingMode == 0 || firingMode == 1) {
+        strip1Color = strip1.Color(255, 0, 0);  // Normal = Red
+      } else if (firingMode == 2 || firingMode == 3) {
+        strip1Color = green;  // Green modes
+      } else if (firingMode == 4 || firingMode == 5) {
+        strip1Color = blue;   // Blue modes
+      } else {
+        strip1Color = yellow; // Yellow modes
+      }
+      
+      for (int i = 0; i < segmentsLit; i++) {
+        strip1.setPixelColor(i, strip1Color);
+      }
+      strip1.show();
+      
+    } else if (overheatMode) {
+      // Overheat mode - blinking effect that counts down over full 11 second duration
+      unsigned long elapsedOverheat = millis() - overheatStartTime;
+      // Map the 11 second duration to 5 pixels (each pixel represents 2.2 seconds)
+      int targetPixel = 4 - (elapsedOverheat / 2200);
+      if (targetPixel < 0) targetPixel = 0;
+      
+      static unsigned long lastBlinkTime = 0;
+      static bool blinkState = false;
+      if (millis() - lastBlinkTime >= 150) {
+        lastBlinkTime = millis();
+        blinkState = !blinkState;
+      }
+      
+      strip1.clear();
+      if (blinkState) {
+        uint32_t strip1Color;
+        
+        // Color based on firing mode
+        if (firingMode == 0 || firingMode == 1) {
+          strip1Color = strip1.Color(255, 0, 0);
+        } else if (firingMode == 2 || firingMode == 3) {
+          strip1Color = green;
+        } else if (firingMode == 4 || firingMode == 5) {
+          strip1Color = blue;
+        } else {
+          strip1Color = yellow;
+        }
+        
+        for (int i = 0; i <= targetPixel; i++) {
+          strip1.setPixelColor(i, strip1Color);
+        }
+      }
+      strip1.show();
+      
+    } else {
+      // Normal animation
+      if (millis() - lastCountUpdate >= countSpeed) {
+        lastCountUpdate = millis();
+        
+        strip1.clear();
+        
+        uint32_t strip1Color;
+        
+        // Color based on firing mode
+        if (firingMode == 0 || firingMode == 1) {
+          strip1Color = strip1.Color(255, 0, 0);
+        } else if (firingMode == 2 || firingMode == 3) {
+          strip1Color = green;
+        } else if (firingMode == 4 || firingMode == 5) {
+          strip1Color = blue;
+        } else {
+          strip1Color = yellow;
+        }
+        
+        for (int i = 0; i <= currentPixel; i++) {
+          strip1.setPixelColor(i, strip1Color);
+        }
+        strip1.show();
+        
+        if (countingUp) {
+          currentPixel++;
+          if (currentPixel >= numPixels1 - 1) {
+            countingUp = false;
+          }
+        } else {
+          currentPixel--;
+          if (currentPixel <= 0) {
+            countingUp = true;
+          }
+        }
+      }
+    }
+    
+    // Handle strips 2 and 3 - streaming effect when firing
+    // For burst modes, keep streaming for 0.1 seconds with adjusted speed
+    // For continuous modes, stream while button is pressed
+    bool shouldStream = false;
+    int currentStreamSpeed;
+    
+    if (firingMode == 1 || firingMode == 3 || firingMode == 5 || firingMode == 7) {
+      // Burst modes - stream for 0.1 seconds with burst speed
+      shouldStream = burstFireActive && (millis() - burstFireStartTime < burstLightDuration);
+      currentStreamSpeed = burstStreamSpeed;  // 13ms for burst
+    } else {
+      // Continuous modes - stream while button pressed with faster speed
+      shouldStream = flowButtonPressed && !overheatMode;
+      currentStreamSpeed = continuousStreamSpeed;  // Using renamed variable
+    }
+    
+    if (shouldStream) {
+      if (millis() - lastStreamUpdate >= currentStreamSpeed) {
+        lastStreamUpdate = millis();
+        
+        uint32_t baseColor;
+        
+        // Color based on firing mode
+        if (firingMode == 0 || firingMode == 1) {
+          baseColor = 0;  // Normal mode uses orange/blue pattern (set below)
+        } else if (firingMode == 2 || firingMode == 3) {
+          baseColor = green;
+        } else if (firingMode == 4 || firingMode == 5) {
+          baseColor = blue;
+        } else {
+          baseColor = yellow;
+        }
+        
+        for (int i = 0; i < numPixels2; i++) {
+          uint32_t color;
+          
+          if (firingMode == 0 || firingMode == 1) {
+            // Normal mode - orange/blue alternating pattern with brightness wave
+            int colorIndex = (i + streamPosition) % 4;
+            int brightIndex = (i + streamPosition) % 8;
+            
+            float brightness;
+            if (brightIndex < 2) {
+              brightness = 1.0;
+            } else if (brightIndex < 4) {
+              brightness = 0.6;
+            } else if (brightIndex < 6) {
+              brightness = 0.3;
+            } else {
+              brightness = 0.1;
+            }
+            
+            if (colorIndex < 2) {
+              // Blue with brightness variation
+              color = strip2.Color(0, 0, 255 * brightness);
+            } else {
+              // Orange with brightness variation
+              color = strip2.Color(255 * brightness, 100 * brightness, 0);
+            }
+          } else {
+            // All other modes - brightness wave effect
+            int brightIndex = (i + streamPosition) % 8;
+            float brightness;
+            
+            if (brightIndex < 2) {
+              brightness = 1.0;
+            } else if (brightIndex < 4) {
+              brightness = 0.6;
+            } else if (brightIndex < 6) {
+              brightness = 0.3;
+            } else {
+              brightness = 0.1;
+            }
+            
+            uint8_t r = (baseColor >> 16) & 0xFF;
+            uint8_t g = (baseColor >> 8) & 0xFF;
+            uint8_t b = baseColor & 0xFF;
+            
+            color = strip2.Color(r * brightness, g * brightness, b * brightness);
+          }
+          
+          strip2.setPixelColor(i, color);
+          strip3.setPixelColor(i, color);
+        }
+        
+        strip2.show();
+        strip3.show();
+        
+        streamPosition--;
+        if (streamPosition < 0) {
+          streamPosition = (firingMode == 0 || firingMode == 1) ? 3 : 7;
+        }
+      }
+    } else {
+      strip2.clear();
+      strip3.clear();
+      strip2.show();
+      strip3.show();
+      streamPosition = 0;
+    }
+  } 
+  // TOGGLE SWITCH OFF - Shutdown state
+  else {
+    // All LEDs stay off, do nothing until switch is turned back on
+    // Shutdown track (0002) was already played when switch turned off
+  }
+}
