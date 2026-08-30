@@ -21,3 +21,7 @@ Tune in and watch the video to find out but I wanted to share the parts list of 
 - Solder No Clean Rosin Core
 - 220 Ohm 1/4 Resistor
 - Diode: Removed but recommend adding if you can find the right size one, I kept blowing mine.
+
+!!!Sound Effects Important Note!!!
+The DF Player mini (maybe its just the cheap ones) doesn't read the file name, its reads the order inserted. You must download the files and copy them over the the SD card one at a time in order.
+You cannot skip a number, if you go 0008 then 0010, it will think 0010 is 0009 and all your calls will be messed up. If anyone knows how to fix this please share.
